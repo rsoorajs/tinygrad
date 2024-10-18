@@ -3,8 +3,8 @@ from typing import Optional, Tuple, Dict, List, cast, TYPE_CHECKING, Any, Defaul
 import functools, itertools, operator
 from collections import defaultdict
 from tinygrad.dtype import dtypes, PtrDType, ImageDType, ConstType
-from tinygrad.ops import UnaryOps, BinaryOps, UOp, UOps, identity_element
-from tinygrad.ops import UPat, PatternMatcher, graph_rewrite, TernaryOps, symbolic_flat, is_irreducible, _get_chain
+from tinygrad.ops import UnaryOps, BinaryOps, TernaryOps, UOp, UOps, UPat, PatternMatcher
+from tinygrad.ops import graph_rewrite, symbolic_flat, is_irreducible, split_uop, identity_element
 from tinygrad.helpers import DEBUG, getenv, flatten, dedup, TRANSCENDENTAL, AMX, prod, partition, all_same
 from tinygrad.codegen.transcendental import xexp2, xlog2, xsin, TRANSCENDENTAL_SUPPORTED_DTYPES
 
@@ -13,7 +13,7 @@ if TYPE_CHECKING: from tinygrad.renderer import Renderer
 # ***** float4/image store handling *****
 
 def fold_expanded(ex, buf):
-  if buf.dtype != PtrDType(dtypes.float) and buf.dtype != PtrDType(dtypes.half) and not isinstance(buf.dtype, ImageDType): return None
+  if buf.dtype != dtypes.float.ptr() and buf.dtype != dtypes.half.ptr() and not isinstance(buf.dtype, ImageDType): return None
   new_srcs = dedup(list(ex.src))
   old_new_srcs = new_srcs[:]
   is_load, is_image = new_srcs[0].op is UOps.LOAD, isinstance(buf.dtype, ImageDType)
@@ -32,7 +32,7 @@ def fold_expanded(ex, buf):
     offsets_rootsrc[root_src][arg] = i
 
   # then rewrite everything we can
-  lengths = [4] if is_image else ([8,4,2] if buf.dtype == PtrDType(dtypes.half) and getenv("ALLOW_HALF8") else ([16,8,4,2] if AMX else [4,2]))
+  lengths = [4] if is_image else ([8,4,2] if buf.dtype == dtypes.half.ptr() and getenv("ALLOW_HALF8") else ([16,8,4,2] if AMX else [4,2]))
   used = set()
   for rootsrc, offsets in offsets_rootsrc.items():
     for o in offsets:
@@ -78,14 +78,14 @@ float4_folding = PatternMatcher([
 
 # ***** image load valid simplification *****
 
-def is_increasing(f:UOp):
+def is_increasing(f:UOp) -> bool:
   # is f a monotonically increasing function regards its input
-  if f.op is UOps.CONST or is_irreducible(f): return True
+  if is_irreducible(f): return True
   if f.op is UOps.ALU and f.arg is BinaryOps.ADD: return is_increasing(f.src[0]) and is_increasing(f.src[1])
   if f.op is UOps.ALU and f.arg in (BinaryOps.MUL, BinaryOps.IDIV) and f.src[1].op is UOps.CONST and f.src[1].arg >= 0: return is_increasing(f.src[0])
   return False  # False if not sure
 
-def replace_uop(uop:UOp, old:UOp, new:UOp):
+def replace_uop(uop:UOp, old:UOp, new:UOp) -> UOp:
   # replace all `old` in `uop` to `new`
   return new if uop is old else uop.replace(src=tuple(replace_uop(s, old, new) for s in uop.src))
 
@@ -100,54 +100,59 @@ def parse_valid(valid:UOp) -> Tuple[UOp, bool, int]:
   if valid.op is UOps.ALU and valid.arg is BinaryOps.CMPLT and valid.src[1].op is UOps.CONST: return valid.src[0], True, valid.src[1].arg-1
   raise ValueError(f"not able to parse {valid=}")
 
-def idx_given_valid(valid:UOp, idx:UOp) -> Optional[UOp]:
-  # return None if valid is always False, otherwise the simplified idx (might be the same as input)
+def uop_given_valid(valid:UOp, uop:UOp) -> Optional[UOp]:
+  # return None if valid is always False, otherwise the simplified uop (might be the same as input)
 
   # first, parse valid into {expr: (lower_bound, upper_bound)}
   bounds:DefaultDict[UOp, List[Optional[ConstType]]] = defaultdict(lambda: [None, None])
-  for stmt in _get_chain(valid, BinaryOps.AND):
+  for stmt in split_uop(valid, BinaryOps.AND):
     expr, is_upper, c = parse_valid(stmt)
     bounds[expr][int(is_upper)] = c
 
-  # simplify idx given that valid is True
-  for uop,v in bounds.items():
+  # simplify uop given that valid is True
+  for expr,v in bounds.items():
     # some expr has lower bound > upper bound -> valid is an empty set and we return None
     if v[0] is not None and v[1] is not None and v[0] > v[1]: return None
 
-    # every candidate is a set of contrained UOp based on valid, and if every item in a set simplifies the idx into a same output, we rewrite idx
+    # every candidate is a set of contrained UOp based on valid, and if every item in a set simplifies the uop into a same output, we rewrite uop
     candidates = []
-    if uop.op is UOps.ALU and uop.arg is BinaryOps.ADD and all(is_irreducible(u) and u.vmin == 0 for u in _get_chain(uop, BinaryOps.ADD)):
+    if expr.op is UOps.ALU and expr.arg is BinaryOps.ADD and all(is_irreducible(u) and u.vmin == 0 for u in split_uop(expr, BinaryOps.ADD)):
       # if the constraint is a simplex: X0 + X1 + ... > 0, we can check if all Xi > 0 simplify into the same output
-      candidates.append([(Xi, UOp.define_var("fake", Xi.dtype, 1, Xi.vmax)) for Xi in _get_chain(uop, BinaryOps.ADD)])
+      candidates.append([(Xi, UOp.variable("fake", 1, Xi.vmax, Xi.dtype)) for Xi in split_uop(expr, BinaryOps.ADD)])
     # try checking the whole clause
-    candidates.append([(uop, UOp.define_var("fake", uop.dtype, uop.vmin if v[0] is None else v[0], uop.vmax if v[1] is None else v[1]))])
+    candidates.append([(expr, UOp.variable("fake", expr.vmin if v[0] is None else v[0], expr.vmax if v[1] is None else v[1], expr.dtype))])
 
     for candidate in candidates:
-      newidxs:List[List[UOp]] = [[], []]
-      for X,newX in candidate:
-        newidx = replace_uop(graph_rewrite(replace_uop(idx, X, newX), sym), newX, X)
-        newidxs[0].append(newidx.src[0])
-        newidxs[1].append(newidx.src[1])
+      # if every branch in candidate gives the same simplified uop, we can rewrite the uop
+      newuops = [replace_uop(graph_rewrite(replace_uop(uop, X, newX), sym), newX, X) for X,newX in candidate]
+      if uop.op is UOps.VECTORIZE and len(uop.src) == 2:
+        if all_same([uops.src[0] for uops in newuops]): uop = uop.replace(src=(newuops[0].src[0], uop.src[1]))
+        if all_same([uops.src[1] for uops in newuops]): uop = uop.replace(src=(uop.src[0], newuops[0].src[1]))
+      elif all_same(newuops): uop = newuops[0]
 
-      # if every branch in candidate gives the same simplified output, we can rewrite the idx
-      if len(newidxs[0])==1 or (len(newidxs[0]) > 1 and all_same(newidxs[0])): idx = idx.replace(src=(newidxs[0][0], idx.src[1]))
-      if len(newidxs[1])==1 or (len(newidxs[1]) > 1 and all_same(newidxs[1])): idx = idx.replace(src=(idx.src[0], newidxs[1][0]))
-  return idx
+  return uop
 
-def simplify_valid_image_load(load:UOp, buf:UOp):
-  if not isinstance(buf_dtype:=buf.dtype, ImageDType) or len(load.src) < 4: return None
+def simplify_buffer_load(load:UOp) -> Optional[UOp]:
+  if not isinstance(load.src[0].dtype, PtrDType) or len(load.src) != 4: return None
   buf, start_idx, invalid_val, valid = load.src
-  if (idx:=idx_given_valid(valid, start_idx)) is None: return load.replace(src=(buf, start_idx, invalid_val, valid.const_like(False)))
+  try:
+    if (idx:=uop_given_valid(valid, start_idx)) is None: return load.replace(src=(buf, start_idx, invalid_val, valid.const_like(False)))
+  except ValueError: return None
+  return None if idx is start_idx else load.replace(src=((buf, idx, invalid_val, valid)))
+
+def simplify_image_load(load:UOp) -> Optional[UOp]:
+  if not isinstance(buf_dtype:=load.src[0].dtype, ImageDType) or len(load.src) != 4: return None
+  buf, start_idx, invalid_val, valid = load.src
+  if (idx:=uop_given_valid(valid, start_idx)) is None: return load.replace(src=(buf, start_idx, invalid_val, valid.const_like(False)))
 
   # can drop valid if idx is out of bound when valid is False
   drop_stmt = []
-  for stmt in _get_chain(valid, BinaryOps.AND):
+  for stmt in split_uop(valid, BinaryOps.AND):
     X, is_upper_bound, c = parse_valid(stmt)
 
     # for X0 + X1 + ... >= 1, check if it's out of bound when Xi = 0 for all i
-    if not is_upper_bound and c == 1 and X.op is UOps.ALU and X.arg is BinaryOps.ADD and \
-      all(is_irreducible(u) and u.vmin == 0 for u in _get_chain(X, BinaryOps.ADD)):
-      testidx = functools.reduce(lambda nowidx,u: replace_uop(nowidx, u, u.const_like(0)), _get_chain(X, BinaryOps.ADD), idx)
+    if not is_upper_bound and c == 1 and all(is_irreducible(u) and u.vmin == 0 for u in split_uop(X, BinaryOps.ADD)):
+      testidx = functools.reduce(lambda nowidx,u: replace_uop(nowidx, u, u.const_like(0)), split_uop(X, BinaryOps.ADD), idx)
       testidx = graph_rewrite(testidx, sym)
       if testidx.src[0].vmax < 0 or testidx.src[1].vmax < 0:
         drop_stmt.append(stmt)
@@ -163,8 +168,8 @@ def simplify_valid_image_load(load:UOp, buf:UOp):
           drop_stmt.append(stmt)
           break
 
-  if not drop_stmt and idx == start_idx: return None
-  new_valid = functools.reduce(operator.and_, ss) if (ss:=[s for s in _get_chain(valid, BinaryOps.AND) if s not in drop_stmt]) else None
+  if not drop_stmt and idx is start_idx: return None
+  new_valid = functools.reduce(operator.and_, ss) if (ss:=[s for s in split_uop(valid, BinaryOps.AND) if s not in drop_stmt]) else None
   return load.replace(src=((buf, idx, invalid_val, new_valid) if new_valid is not None else (buf, idx)))
 
 # ***** optional patterns *****
@@ -341,15 +346,15 @@ sym = symbolic_flat+PatternMatcher([
   (UPat.store(UPat.var("buf"), UPat.var("idx"), UPat.var("gate").where(UPat.var("alt"), UPat.load(UPat.var("buf"), UPat.var("idx")))),
    lambda buf, idx, gate, alt: UOp.store(buf, idx, alt, gate)),
   # fold gated LOAD/STORE
-  (UPat.load(UPat.var("buf"), UPat.var("idx"), UPat.var("var"), UPat.const(None, True)),
+  (UPat.load(UPat.var("buf"), UPat.var("idx"), UPat.var("var"), UPat.const(dtypes.bool, True)),
    lambda buf,idx,var: UOp.load(buf, idx, dtype=var.dtype)),
-  (UPat.load(UPat.var("buf"), UPat.var("idx"), UPat.var("var"), UPat.const(None, True), UPat.var("barrier")),
+  (UPat.load(UPat.var("buf"), UPat.var("idx"), UPat.var("var"), UPat.const(dtypes.bool, True), UPat.var("barrier")),
    lambda buf,idx,var,barrier: UOp.load(buf, idx, barrier, dtype=var.dtype)),
-  (UPat.load(UPat.var(), UPat.var(), UPat.var("var"), UPat.const(None, False)), lambda var: var),
-  (UPat.load(UPat.var(), UPat.var(), UPat.var("var"), UPat.const(None, False), UPat.var()), lambda var: var),
-  (UPat.store(UPat.var("buf"), UPat.var("idx"), UPat.var("val"), UPat.const(None, True)),
+  (UPat.load(UPat.var(), UPat.var(), UPat.var("var"), UPat.const(dtypes.bool, False)), lambda var: var),
+  (UPat.load(UPat.var(), UPat.var(), UPat.var("var"), UPat.const(dtypes.bool, False), UPat.var()), lambda var: var),
+  (UPat.store(UPat.var("buf"), UPat.var("idx"), UPat.var("val"), UPat.const(dtypes.bool, True)),
    lambda buf,idx,val: UOp.store(buf, idx, val)), # pylint: disable=unnecessary-lambda
-  (UPat.store(UPat.var(), UPat.var(), UPat.var(), UPat.const(None, False)), lambda: UOp(UOps.NOOP)),
+  (UPat.store(UPat.var(), UPat.var(), UPat.var(), UPat.const(dtypes.bool, False)), lambda: UOp(UOps.NOOP)),
   # remove NOOPs from SINK
   (UPat(UOps.SINK, name="root"),
     lambda root: UOp(UOps.SINK, root.dtype, a, root.arg) if len(a:=tuple(x for x in root.src if x.op is not UOps.NOOP)) != len(root.src) else None),
@@ -534,12 +539,11 @@ reducer = PatternMatcher([
   (UPat(UOps.STORE, name="root"), delete_redundant_gates),
   # late fixup of unfoldable image loads
   (UPat(UOps.LOAD, src=(UPat.var("buf"), UPat()), allow_any_len=True, name="load"), fix_unfoldable_image_load),
-  # image load valid simplification
-  (UPat(UOps.LOAD, src=(UPat.var("buf"), UPat()), allow_any_len=True, name="load"), simplify_valid_image_load),
+  # image load valid idx simplification
+  (UPat(UOps.LOAD, name="load"), simplify_image_load),
+  # buffer load valid idx simplification
+  (UPat(UOps.LOAD, name="load"), simplify_buffer_load),
 ])
-
-no_pyint = PatternMatcher([(UPat((UOps.CONST, UOps.VCONST, UOps.ALU, UOps.SPECIAL, UOps.RANGE, UOps.EXPAND, UOps.VECTORIZE, UOps.DEFINE_VAR),
-  name="x"), lambda x: UOp(x.op, dtypes.int32.vec(x.dtype.count), x.src, x.arg) if x.dtype.scalar() == dtypes.pyint else None)])
 
 # *** uop graph ***
 
@@ -551,9 +555,6 @@ def full_graph_rewrite(sink:UOp, opts:Optional[Renderer]=None) -> UOp:
   # do graph rewrite
   acc_number = 0
   sink = graph_rewrite(sink, sym)
-
-  # rewrite pyint to int32
-  sink = graph_rewrite(sink, no_pyint)
 
   # expand
   linearize_cnt += 1

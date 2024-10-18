@@ -9,11 +9,11 @@ from tinygrad.dtype import DType, DTypeLike, dtypes, ImageDType, ConstType, leas
 from tinygrad.helpers import argfix, make_pair, flatten, prod, all_int, round_up, merge_dicts, argsort, getenv, all_same, fully_flatten, dedup
 from tinygrad.helpers import IMAGE, DEBUG, WINO, _METADATA, Metadata, TRACEMETA, ceildiv
 from tinygrad.multi import MultiLazyBuffer
-from tinygrad.ops import MetaOps, truncate, smax, resolve, UOp, UOps, BinaryOps
+from tinygrad.ops import MetaOps, truncate, smax, resolve, UOp, UOps, BinaryOps, sint, Variable
 from tinygrad.device import Device, Buffer, BufferOptions
-from tinygrad.shape.symbolic import sint, Variable
 from tinygrad.engine.lazy import LazyBuffer
-from tinygrad.engine.realize import run_schedule, memory_planner
+from tinygrad.engine.realize import run_schedule
+from tinygrad.engine.memory import memory_planner
 from tinygrad.engine.schedule import ScheduleItem, create_schedule_with_vars
 
 # **** start with two base classes, Tensor and Function ****
@@ -211,9 +211,6 @@ class Tensor:
 
     NOTE: A Tensor can only be scheduled once.
     """
-    if getenv("FUZZ_SCHEDULE"):
-      from test.external.fuzz_schedule import fuzz_schedule
-      fuzz_schedule(flatten([x.lazydata.lbs for x in (self,)+lst]))
     schedule, var_vals = create_schedule_with_vars(flatten([x.lazydata.lbs for x in (self,)+lst]))
     return memory_planner(schedule), var_vals
 
@@ -1682,7 +1679,7 @@ class Tensor:
 
   def _softmax(self, axis, dtype:Optional[DTypeLike]=None):
     x = self.cast(dtype) if dtype is not None else self
-    m = x - x.max(axis=axis, keepdim=True)
+    m = x - x.max(axis=axis, keepdim=True).detach()
     e = m.exp()
     return m, e, e.sum(axis=axis, keepdim=True)
 

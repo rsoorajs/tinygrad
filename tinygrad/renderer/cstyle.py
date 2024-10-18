@@ -7,11 +7,11 @@ from tinygrad.helpers import strip_parens, getenv, prod, dedup, AMX
 from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType
 from tinygrad.renderer import Renderer, TensorCore
 
-def _render_index(r:CStyleLanguage, buf:UOp, idx:UOp, dtype:DType):
+def _render_index(r:CStyleLanguage, buf:UOp, idx:UOp, dtype:DType) -> str:
   sidx = strip_parens(r[idx]) if idx.arg == BinaryOps.ADD else r[idx]
   if dtype.count > 1 and isinstance(buf.dtype, PtrDType):
-    return f"*(({r.smem_prefix if buf.dtype.local and r.smem_prefix_for_cast else r.buffer_prefix}{r.render_dtype(dtype)}*)({r[buf]}+{sidx}))"
-  return f"*({r[buf]}+{sidx})" if r.uses_ptr_arithmetic else f"{r[buf]}[{sidx}]"
+    return f"(({r.smem_prefix if buf.dtype.local and r.smem_prefix_for_cast else r.buffer_prefix}{r.render_dtype(dtype)}*)({r[buf]}+{sidx}))"
+  return f"({r[buf]}+{sidx})"
 
 base_rewrite = PatternMatcher([
   (UPat(UOps.DEFINE_ACC, name="x"), lambda r,x: r[x.src[0]]),
@@ -42,11 +42,11 @@ base_rewrite = PatternMatcher([
   (UPat(UOps.CONST, name="x"), lambda r,x: str(x.arg)),
   # load/store
   (UPat(UOps.LOAD, src=(UPat.var("buf"), UPat.var('idx'), UPat.var("var"), UPat.var("gate")), name="load"),
-   lambda r,buf,idx,load,var,gate: f"({r[gate]}?{_render_index(r, buf, idx, load.dtype)}:{r[var]})"),
+   lambda r,buf,idx,load,var,gate: f"({r[gate]}?*{_render_index(r, buf, idx, load.dtype)}:{r[var]})"),
   (UPat(UOps.LOAD, src=(UPat.var("buf"), UPat.var('idx')), allow_any_len=True, name="load"),
-   lambda r,buf,idx,load: _render_index(r, buf, idx, load.dtype)),
+   lambda r,buf,idx,load: f"*{_render_index(r, buf, idx, load.dtype)}"),
   (UPat(UOps.STORE, src=(UPat.var("buf"), UPat.var('idx'), UPat.var("var")), allow_any_len=True),
-   lambda r,buf,idx,var: f"{_render_index(r, buf, idx, var.dtype)} = {r[var]};"),
+   lambda r,buf,idx,var: f"*{_render_index(r, buf, idx, var.dtype)} = {r[var]};"),
   # alu/gep
   (UPat(UOps.ALU, name="x"), lambda r,x: r.code_for_op[x.arg](
     *([strip_parens(r[v]) if v.arg == x.arg and x.arg in {BinaryOps.ADD, BinaryOps.MUL, BinaryOps.XOR} else r[v] for v in x.src]), x.dtype)),
@@ -65,6 +65,8 @@ extra_pm = PatternMatcher([
   # gate any stores that aren't gated with ifs
   (UPat(UOps.STORE, dtype=dtypes.void, src=(UPat(), UPat(), UPat(), UPat(dtype=dtypes.bool)), name="store"),
     lambda store: UOp(UOps.STORE, src=store.src[:3]+(UOp(UOps.IF, src=(store.src[3],)),))),
+  # rewrite MAX to CMPLT + WHERE (max function is annoying on many cstyle backends)
+  (UPat(UOps.ALU, name="m", arg=BinaryOps.MAX), lambda m: (m.src[0] < m.src[1]).where(m.src[1], m.src[0])),
 ])
 
 class CStyleLanguage(Renderer):
@@ -79,7 +81,6 @@ class CStyleLanguage(Renderer):
   code_for_workitem: Dict[Union[Literal["g"], Literal["l"], Literal["i"]], Callable] = {}
   extra_args: List[str] = []
   float4: Optional[str] = None
-  uses_ptr_arithmetic: bool = False
   type_map: Dict[DType, str] = {}
   infinity: str = "INFINITY"
   nan: str = "NAN"
@@ -89,7 +90,7 @@ class CStyleLanguage(Renderer):
     UnaryOps.NEG: lambda x,dtype: f"-{x}",
     UnaryOps.EXP2: lambda x,dtype: f"exp2({x})", UnaryOps.LOG2: lambda x,dtype: f"log2({x})", UnaryOps.SIN: lambda x,dtype: f"sin({x})",
     BinaryOps.SHL: lambda a,b,dtype: f"({a}<<{b})", BinaryOps.SHR: lambda a,b,dtype: f"({a}>>{b})",
-    BinaryOps.ADD: lambda a,b,dtype: f"({a}+{b})", BinaryOps.SUB: lambda a,b,dtype: f"({a}-{b})", BinaryOps.MAX: lambda a,b,dtype: f"max({a},{b})",
+    BinaryOps.ADD: lambda a,b,dtype: f"({a}+{b})", BinaryOps.SUB: lambda a,b,dtype: f"({a}-{b})",
     BinaryOps.IDIV: lambda a,b,dtype: f"({a}/{b})", BinaryOps.MUL: lambda a,b,dtype: f"({a}*{b})", BinaryOps.MOD: lambda a,b,dtype: f"({a}%{b})",
     BinaryOps.CMPLT: lambda a,b,dtype: f"({a}<{b})", BinaryOps.CMPNE: lambda a,b,dtype: f"({a}!={b})", BinaryOps.XOR: lambda a,b,dtype: f"({a}^{b})",
     BinaryOps.AND: lambda a,b,dtype: f"({a}&{b})", BinaryOps.OR: lambda a,b,dtype: f"({a}|{b})",
@@ -101,16 +102,19 @@ class CStyleLanguage(Renderer):
   def get_kernel_modifier(self, uops:List[UOp]) -> str: return ""
   def render_kernel(self, function_name:str, kernel:List[str], bufs:List[Tuple[str,Tuple[DType,bool]]], uops:List[UOp], prefix=None) -> str:
     tmp = "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n" if any(isinstance(dtype, ImageDType) for _,(dtype,_) in bufs) else ""  # noqa: E501
-    buftypes = [(name,f"{'write_only' if mutable else 'read_only'} image2d_t" if dtype.name.startswith('image') else
-                ("" if mutable else "const ")+self.buffer_prefix+self.render_dtype(dtype)+"*"+self.buffer_suffix if isinstance(dtype, PtrDType) else
+    buftypes = [(name, self.render_dtype(dtype, mutable)+self.buffer_suffix if isinstance(dtype, (ImageDType, PtrDType)) else
                 self.arg_int_prefix if dtype == dtypes.int else None) for name,(dtype,mutable) in bufs]
     prg = ''.join([f"{self.kernel_prefix}void {self.get_kernel_modifier(uops)}{function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
     [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
     return prg if prefix is None else "\n".join(prefix)+f"\n{prg}"
 
-  def render_dtype(self, var_dtype:DType) -> str:
-    return self.type_map.get(scalar:=var_dtype.scalar(), scalar.name) + (str(var_dtype.count) if (var_dtype.count) > 1 else "")
+  def render_dtype(self, dt:DType, mutable=True) -> str:
+    if isinstance(dt, ImageDType):
+      return f"{'write_only' if mutable else 'read_only'} image2d_t"
+    if isinstance(dt, PtrDType):
+      return (self.smem_prefix if dt.local else self.buffer_prefix) + self.render_dtype(dt.base) + ("*" if isinstance(dt, PtrDType) else "")
+    return self.type_map.get(scalar:=dt.scalar(), scalar.name) + (str(dt.count) if (dt.count) > 1 else "")
 
   def __getitem__(self, key): return self.r[key]  # hacky helper
   def render(self, name:str, uops:List[UOp]) -> str:
@@ -123,17 +127,15 @@ class CStyleLanguage(Renderer):
     depth = 1
     c: DefaultDict[str, int] = defaultdict(int)
     for u in uops:
-      if u.op is UOps.DEFINE_GLOBAL:
-        r[u] = f"data{u.arg}"
-        bufs[u] = (r[u], (u.dtype, False))
-        continue
-      if u.op is UOps.DEFINE_VAR:
-        r[u] = u.arg[0]
+      if u.op in (UOps.DEFINE_GLOBAL, UOps.DEFINE_VAR):
+        r[u] = f"data{u.arg}" if u.op is UOps.DEFINE_GLOBAL else u.arg[0]
         bufs[u] = (r[u], (u.dtype, False))
         continue
 
       # mark buffers that we store to writable
-      if u.op is UOps.STORE and u.src[0].op is UOps.DEFINE_GLOBAL: bufs[u.src[0]] = (bufs[u.src[0]][0], (bufs[u.src[0]][1][0], True))
+      if u.op is UOps.STORE:
+        for up in u.src[0].sparents:
+          if up.op is UOps.DEFINE_GLOBAL: bufs[up] = (bufs[up][0], (bufs[up][1][0], True))
 
       # naming
       prefix = None
@@ -150,7 +152,7 @@ class CStyleLanguage(Renderer):
 
       if u.op in {UOps.ENDIF, UOps.ENDRANGE}: depth -= 1
       if u.op in {UOps.CONST, UOps.GEP} or (u.op in {UOps.VECTORIZE, UOps.ALU, UOps.CAST, UOps.BITCAST}
-                                            and child_count[u] == 1 and u.arg is not BinaryOps.MAX and not getenv("EXPAND_SSA")):
+                                            and child_count[u] == 1 and not getenv("EXPAND_SSA")):
         r[u] = l
       else:
         if u.op in {UOps.RANGE, UOps.ASSIGN, UOps.DEFINE_LOCAL} or u.dtype == dtypes.void:
@@ -177,8 +179,7 @@ class ClangRenderer(CStyleLanguage):
   buffer_suffix = " restrict"
   type_map = {dtypes.bool:"_Bool", dtypes.half:"__fp16"}
   code_for_op = {**({k:v for k,v in CStyleLanguage.code_for_op.items() if k not in [UnaryOps.EXP2, UnaryOps.SIN, UnaryOps.LOG2]}),
-                 UnaryOps.SQRT: lambda x,dtype: f"__builtin_sqrtl({x})" if dtype == dtypes.float64 else f"__builtin_sqrtf({x})",
-                 BinaryOps.MAX: lambda a,b,dtype: f"(({a}>{b})?{a}:{b})"}
+                 UnaryOps.SQRT: lambda x,dtype: f"__builtin_sqrtl({x})" if dtype == dtypes.float64 else f"__builtin_sqrtf({x})"}
 
   if AMX:
     tensor_cores = [TensorCore(dims=(sz,sz,1), threads=[], reduce_axes=[], upcast_axes=([(1,sz)],[(0,sz)],[(1,sz),(0,sz)]), dtype_in=dt, dtype_out=dt)
@@ -239,9 +240,6 @@ class IntelRenderer(OpenCLRenderer):
     (UPat(UOps.CAST, dtype=dtypes.float, src=(UPat.var('x', dtype=dtypes.bfloat16))), lambda r,x: f"intel_convert_as_bfloat16_float({r[x[0]]})"),
   ]) + OpenCLRenderer.string_rewrite
 
-  def render_dtype(self, var_dtype:DType) -> str:
-    return f"ushort{var_dtype.count}" if "bfloat16" in var_dtype.name else super().render_dtype(var_dtype)
-
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
     prefix = []
     for arg in dedup([uop.arg for uop in uops if uop.op is UOps.WMMA]):
@@ -265,7 +263,6 @@ class MetalRenderer(CStyleLanguage):
   arg_int_prefix = "constant int&"
   barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
   float4 = "float4"
-  uses_ptr_arithmetic = True
   code_for_workitem = {"g": lambda x: f"gid.{chr(120+int(x))}", "l": lambda x: f"lid.{chr(120+int(x))}"}
   # uint3 used for gid/lid - TODO: this should probably be `ushort3 lid [[thread_position_in_threadgroup]]`
   extra_args = ['uint3 gid [[threadgroup_position_in_grid]]', 'uint3 lid [[thread_position_in_threadgroup]]']
@@ -279,7 +276,7 @@ class MetalRenderer(CStyleLanguage):
     # NOTE: this is copied from PTX
     *[(UPat(UOps.ALU, arg=op, dtype=dtypes.bfloat16, name="x"),
       lambda x: (UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.bfloat16)))
-      for op in [BinaryOps.MAX, UnaryOps.SQRT, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN]]
+      for op in [UnaryOps.SQRT, UnaryOps.EXP2, UnaryOps.LOG2, UnaryOps.SIN]]
   ]) + extra_pm
 
   string_rewrite = PatternMatcher([
@@ -294,8 +291,7 @@ class MetalRenderer(CStyleLanguage):
   return {arg[3].name}2(c.thread_elements()[0], c.thread_elements()[1]);\n}}""")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
-code_for_op_half = {UnaryOps.RECIP: lambda x,dtype: f"hrcp({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"1/{x}",
-                    BinaryOps.MAX: lambda a,b,dtype: f"__hmax({a},{b})" if dtype in (dtypes.half, dtypes.bfloat16) else f"max({a},{b})",
+code_for_op_half = {UnaryOps.RECIP: lambda x,dtype: f"hrcp({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"(1/{x})",
                     UnaryOps.SQRT: lambda x,dtype: f"hsqrt({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"sqrt({x})",
                     UnaryOps.SIN: lambda x,dtype: f"hsin({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"sin({x})",
                     UnaryOps.LOG2: lambda x,dtype: f"hlog2({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"log2({x})",
@@ -365,9 +361,7 @@ class CUDARenderer(CStyleLanguage):
 code_for_op_hip = { UnaryOps.SQRT: lambda x,dtype: f"__ocml_sqrt_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})",
                     UnaryOps.SIN: lambda x,dtype: f"__ocml_sin_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})",
                     UnaryOps.LOG2: lambda x,dtype: f"__ocml_log2_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})",
-                    UnaryOps.EXP2: lambda x,dtype: f"__ocml_exp2_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})",
-                    # TODO: MAX with int uses fmax_f32?
-                    BinaryOps.MAX: lambda a,b,dtype: f"__ocml_fmax_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32) }({a},{b})",}
+                    UnaryOps.EXP2: lambda x,dtype: f"__ocml_exp2_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"}
 
 class AMDRenderer(CStyleLanguage):
   device = "AMD"
@@ -392,13 +386,14 @@ class AMDRenderer(CStyleLanguage):
   barrier = '__builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");' + '__builtin_amdgcn_s_barrier();' + \
             '__builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");'
   float4 = "make_float4"
-  uses_ptr_arithmetic = False  # NOTE: this fixes TestLinearizerOverflowAlt
   type_map = {dtypes.bfloat16: "hip_bfloat16"}
   extra_matcher = PatternMatcher([
     (UPat(UOps.ALU, arg=TernaryOps.WHERE, src=(UPat.var("b"), UPat.var("x", dtype=dtypes.bfloat16), UPat.var("y", dtype=dtypes.bfloat16))),
       lambda b,x,y: UOp(UOps.ALU, arg=TernaryOps.WHERE, dtype=dtypes.float, src=(b,x.cast(dtypes.float),y.cast(dtypes.float))).cast(dtypes.bfloat16)),
-    *[(UPat(UOps.ALU, dtype=dtypes.bfloat16, name="x"),
-      lambda x: (UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.bfloat16)))]]) + extra_pm
+    (UPat(UOps.ALU, dtype=dtypes.bfloat16, name="x"),
+      lambda x: UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.bfloat16)),
+    (UPat(UOps.ALU, dtypes.bool, name="alu", src=(UPat.var("x", dtype=dtypes.bfloat16), UPat.var("y", dtype=dtypes.bfloat16))),
+      lambda alu,x,y: UOp(alu.op, dtypes.bool, (x.cast(dtypes.float), y.cast(dtypes.float)), alu.arg))]) + extra_pm
 
   def render_vector_prefix(self, dtype:DType) -> str:
     vec, scal = self.render_dtype(dtype), self.render_dtype(dtype.scalar())
@@ -422,8 +417,6 @@ struct hip_bfloat16 {
     return *reinterpret_cast<float*>(&uval);
   }
 };
-static inline __attribute__((device)) bool operator<(hip_bfloat16 a, hip_bfloat16 b) { return ((float)a) < ((float)b); }
-static inline __attribute__((device)) bool operator==(hip_bfloat16 a, hip_bfloat16 b) { return ((float)a) == ((float)b); }
 """)
 
     for dtype in dedup(uop.dtype for uop in uops if uop.dtype.count > 1): prefix.append(self.render_vector_prefix(dtype))
